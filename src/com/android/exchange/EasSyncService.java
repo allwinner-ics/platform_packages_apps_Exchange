@@ -510,8 +510,13 @@ public class EasSyncService extends AbstractSyncService {
                         .end().end().done();
                     resp = sendHttpClientPost("FolderSync", s.toByteArray());
                     code = resp.getStatus();
-                    // We'll get one of the following responses if policies are required
-                    if (EasResponse.isProvisionError(code)) {
+                    // Handle HTTP error responses accordingly
+                    if (code == HttpStatus.SC_FORBIDDEN) {
+                        // For validation only, we take 403 as ACCESS_DENIED (the account isn't
+                        // authorized, possibly due to device type)
+                        resultCode = MessagingException.ACCESS_DENIED;
+                    } else if (EasResponse.isProvisionError(code)) {
+                        // The device needs to have security policies enforced
                         throw new CommandStatusException(CommandStatus.NEEDS_PROVISIONING);
                     } else if (code == HttpStatus.SC_NOT_FOUND) {
                         // We get a 404 from OWA addresses (which are NOT EAS addresses)
@@ -572,7 +577,7 @@ public class EasSyncService extends AbstractSyncService {
                         resultCode = MessagingException.SECURITY_POLICIES_UNSUPPORTED;
                         bundle.putStringArray(
                                 EmailServiceProxy.VALIDATE_BUNDLE_UNSUPPORTED_POLICIES,
-                                ((pp == null) ? new String[0] : pp.getUnsupportedPolicies()));
+                                ((pp == null) ? null : pp.getUnsupportedPolicies()));
                 } else if (CommandStatus.isDeniedAccess(status)) {
                     userLog("Denied access: ", CommandStatus.toString(status));
                     resultCode = MessagingException.ACCESS_DENIED;
@@ -804,7 +809,7 @@ public class EasSyncService extends AbstractSyncService {
                     MessagingException.IOERROR);
         } catch (MessagingException e) {
             bundle.putInt(EmailServiceProxy.AUTO_DISCOVER_BUNDLE_ERROR_CODE,
-                    MessagingException.AUTHENTICATION_FAILED);
+                    MessagingException.AUTODISCOVER_AUTHENTICATION_FAILED);
         }
         return bundle;
     }
@@ -1691,13 +1696,6 @@ public class EasSyncService extends AbstractSyncService {
                         // Save the protocol version in the account; if we're using 12.0 or greater,
                         // set the flag for support of SmartForward
                         cv.put(Account.PROTOCOL_VERSION, mProtocolVersion);
-                        if (mProtocolVersionDouble >= 12.0) {
-                            cv.put(Account.FLAGS,
-                                    mAccount.mFlags |
-                                    Account.FLAGS_SUPPORTS_SMART_FORWARD |
-                                    Account.FLAGS_SUPPORTS_SEARCH |
-                                    Account.FLAGS_SUPPORTS_GLOBAL_SEARCH);
-                        }
                         mAccount.update(mContext, cv);
                         cv.clear();
                         // Save the sync time of the account mailbox to current time
@@ -1710,6 +1708,16 @@ public class EasSyncService extends AbstractSyncService {
                 } finally {
                     resp.close();
                 }
+            }
+
+            // Make sure we've upgraded flags for ICS if we're using v12.0 or later
+            if (mProtocolVersionDouble >= 12.0 &&
+                    (mAccount.mFlags & Account.FLAGS_SUPPORTS_SEARCH) == 0) {
+                cv.clear();
+                mAccount.mFlags = mAccount.mFlags | Account.FLAGS_SUPPORTS_SMART_FORWARD |
+                        Account.FLAGS_SUPPORTS_SEARCH | Account.FLAGS_SUPPORTS_GLOBAL_SEARCH;
+                cv.put(AccountColumns.FLAGS, mAccount.mFlags);
+                mAccount.update(mContext, cv);
             }
 
             // Change all pushable boxes to push when we start the account mailbox
@@ -1743,8 +1751,10 @@ public class EasSyncService extends AbstractSyncService {
                             }
                         }
                     } else if (EasResponse.isProvisionError(code)) {
+                        userLog("FolderSync provisioning error: ", code);
                         throw new CommandStatusException(CommandStatus.NEEDS_PROVISIONING);
                     } else if (EasResponse.isAuthError(code)) {
+                        userLog("FolderSync auth error: ", code);
                         mExitStatus = EXIT_LOGIN_FAILURE;
                         return;
                     } else {
@@ -2067,6 +2077,9 @@ public class EasSyncService extends AbstractSyncService {
                             mExitStatus = EXIT_LOGIN_FAILURE;
                             userLog("Authorization error during Ping: ", code);
                             throw new IOException();
+                        } else if (EasResponse.isProvisionError(code)) {
+                            userLog("Provisioning required during Ping: ", code);
+                            throw new CommandStatusException(CommandStatus.NEEDS_PROVISIONING);
                         }
                     } finally {
                         resp.close();
